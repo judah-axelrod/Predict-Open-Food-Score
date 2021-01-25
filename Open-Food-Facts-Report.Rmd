@@ -1,0 +1,362 @@
+---
+title: "Open Food Facts - Supervised Learning Analysis"
+author: "Judah Axelrod"
+output: pdf_document
+urlcolor: blue
+---
+
+```{r setup, include=FALSE}
+library(tidyverse)
+library(readxl)
+library(glmnet)
+library(FNN)
+library(mgcv)
+library(tree)
+library(randomForest)
+library(gbm)
+setwd('[ENTER PATH]']
+food <- read_tsv('en.openfoodfacts.org.products.tsv')
+brands_lookup <- read_csv('brands_lookup.csv')
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Part I - Data Preparation and EDA
+
+## Data Source and Research Questions
+[https://www.kaggle.com/openfoodfacts/world-food-facts](https://www.kaggle.com/openfoodfacts/world-food-facts)  
+The raw data has 314,496 observations with 163 variables. I am interested in answering 2 main questions:  
+
+1. Can I build a model to accurately predict the nutrition score that France assigns to each food?
+2. What are some of the underlying variables that drive the nutrition score?
+
+
+## Data Cleaning
+I take the following steps to prepare the data for modeling:  
+
+1. First, limit to only observations that have a France nutrition score value, as this will be the outcome variable of interest.  
+2. Compute and plot the number of missing values for each column. To be conservative, I only discard variables that have less than 100,000 non-missing values, as there seems to be an inflection point around 100,000 when I plot the sorted number of non-missing observations for every variable. After eliminating a few irrelevant variables, I am left with 19 predictors.  
+3. I had to drop the 'Country' variable because the remaining data were so heavily skewed toward the United States that there was little variation to exploit.  
+4. Finally, remove all missing values for the remaining variables. This leaves me with a dataset of 96,333 observations and 20 total variables. Here is the list of candidate predictors after data cleaning:  
+
+|**Predictors** |     |     |     |
+|-----------------|-----------------------|------------------|-----------------|
+| Energy per 100g |  Saturated Fat per 100g |  Sugars per 100g  | Proteins per 100g | 
+|Salt per 100g | Sodium per 100g |  Calcium per 100g |  Fat per 100g     | 
+|Fiber per 100g| Cholesterol per 100g | Number of Additives | Trans Fat per 100g | 
+| Iron per 100g | Vitamin A per 100g | Vitamin C per 100g | Carbohydrates per 100g | 
+| Ingredients from Palm Oil | Ingredients that may be from Palm Oil | Brand(s) associated with the food ||
+
+## Brand Cleaning
+
+* There are over 16,000 unique brands in the dataset, which is far too many values of a categorical variable to be computationally feasible. I create a brands lookup file to merge on a cleaned brands value.
+* Any brands associated with less than 150 unique foods are grouped into a large 'Other' category.
+* For foods with multiple brands, choose just the first one listed for simplicity.
+* After cleaning, I am left with just 44 brands, a more feasible number.
+
+
+## Highlights of Further Data Exploration  
+
+* Taking a look at the distribution for nutrition score, the values range from -10 to 36, and they seem to have two peaks, roughly around 0 and 14. The overlay of a normal density line onto the histogram confirms that the scores are not normally distributed, as does a QQ-plot.
+* I also generate a correlation heat map to get a sense of what predictors may be most important. Judging by this tile plot, the predictors most correlated with nutrition score are a food's energy, saturated fat, sugar, fat, and fiber content.
+
+# Part II - Modeling France's Nutrition Score
+
+First, I divide the dataset into a $\frac{2}{3}$ training/validation set used to tune each model, and a $\frac{1}{3}$ test set, which will be used to compare the final forms of each type of model.
+
+## Variable Selection and Linear Regression
+
+I first run a LASSO regression to perform feature selection. Because the LASSO uses an $L_1$ penalty, it can choose a sparser model with some of the 19 possible independent variables being shrunk to zero. After fitting a LASSO to the training set and performing 10-fold cross validation, only 4 of the variables have nonzero coefficients: Energy per 100g, Saturated Fat per 100g, Sugars per 100g, and Fiber per 100g. These overlap nicely with the most highly correlated variables found during EDA, so the result looks more trustworthy.
+
+The LASSO shrinks the magnitudes of all coefficients, even the nonzero ones, and therefore introduces bias into the estimation. Because of this, I fit the following linear regression model to the training data using just the selected variables. I will calculate a test error at the end of the analysis:
+$$nutritionScore_{i} = \beta_0 + \beta_1Energy_i + \beta_2SatFat_i + \beta_3Sugars_i + \beta_4Fibers_i$$
+
+## KNN Regression
+
+I want to compare the Linear Regression results with a non-parametric alternative, KNN Regression, to see if a more flexible method will perform better. I use just the 4 variables selected above by the LASSO in order to directly compare the two statistical learning methods. Again, I run 10-fold cross validation in order to select an optimal number of neighbors $k$ to consider, finding the lowest CV-error to occur at $k=5$. Finally, I refit the 5-NN model and use it compute a test error on the test dataset. Since 5 is a relatively small number of neighbors for such a large dataset, this should yield a far more flexible fit than the Linear Regression above.
+
+## Generalized Additive Model
+
+The GAM serves as a compromise between the inflexibility of the Linear Regression which could lead to higher bias, and the very flexible, nonparametric KNN Regression which may be more prone to overfitting. Because I am interested not just in prediction, but also in better understanding the drivers of nutrition score, a GAM allows us to retain the additive, parametric structure of linear regression while utilizing splines to account for the likely non-linearities inherent in the data.
+
+To perform variable selection here, I use the group LASSO (implemented by using the 'select = TRUE' option in the mgcv package). The group LASSO uses an $L_2$ penalty, which means that either the entire group is selected or none of the smoothing parameters corresponding to a given predictor are selected (i.e. there is within-group sparsity).
+
+Interestingly, I can see from the summary and plots of each smoothing function that almost none of the predictors are shrunk to exactly zero; in fact, only Iron per 100g looks to be zero from the plot. The plots of several other variables (like Trans Fat per 100g, Vitamin A per 100g, etc.) look heavily shrunken toward zero but not entirely. This suggests that almost all the numeric variables play at least a small role in predicting nutrition score. I will later calculate a test error on this fitted GAM model, which I note performed far better on the test set than a GAM fitted without the group LASSO shrunken coefficients.
+
+One final note on the GAM: I can see from the *gam.check* diagnostic that many of the p-values corresponding to the k-indices are extremely low even though the corresponding coefficients were shrunk to zero. This is likely because the dimension $k$ of the basis was too low. Had I been able to increase k, the GAM may have led to stabler fits - and indeed in the plots I can see some unstable behavior at the tails for several predictors. However, to increase the basis size for all of the candidate predictors was too computationally intensive for this analysis.
+
+## Tree-Based Methods
+### Regression Tree
+
+Next, I move on to tree-based methods, beginning with just a single regression tree. Including all predictors (besides the brand), I use 10-fold cross validation on the training/validation set to select the optimal number of terminal nodes through cost-complexity pruning, which I find to be 9. I then trim the original tree to obtain our final subtree with 9 terminal nodes.
+
+Plotting the tree, note that the first split occurs using Saturated Fat per 100g, while further splits occur on Salt, Sugars, and Fiber per 100g. Again, there is significant overlap between the predictors used for splitting and those obtained from variable selection above, a nice sanity check of the results.
+
+### Random Forest
+
+A single decision tree, as will become clear, tends to perform poorly in terms of prediction and suffer from low robustness. By using the bootstrap approach to repeatedly sample from our data, I can obtain a more powerful result through Bagging. However, to ensure that the same variable is not selected at the first split for all $B$ trees, I use the Random Forest approach to only consider a subset $m$ of all $p$ predictors as candidates at every split. Specifically, the RandomForest package recommends choosing $\frac{p}{3}$ predictors for a regression specification, so I choose $m = 6$.
+
+To select the number of trees, I picked as large a number as was computationally feasible, in this case 250 trees. Fitting on the training set, I calculated an out-of-bag MSE for each number of trees and plotted the result. Beyond roughly 150 trees, the decrease in MSE is negligible, and I therefore use a 150-tree random forest as our preferred model on the test dataset.
+
+Looking at the variable importance plot, I again see Saturated Fat, Sugars, and Fiber per 100g as among the predictors that led to (1) the largest increase in MSE when excluded and (2) the largest increase in node purity when included. 
+
+### Boosting
+
+Finally, I make use of boosting, which grows each new tree based on the residuals of previous trees and then updates the model by adding a shrunken version of that tree to the previous results. In addition to the number of trees $B$, I also need to choose the shrinkage parameter $\lambda$ and the interaction depth $d$. To do this, I create a parameter grid and fit a boosting model for each combination of candidate parameter values. Due to computational limitations, I don't use CV for this; rather, I simply use a 70% training set and 30% validation set, as well as $B = 5,000$ trees.
+
+The validation error would keep decreasing for more trees, but it was computationally impractical to use a higher number - plus, unlike a random forest, boosting can be prone to eventual overfitting. The results of tuning yield $B = 5,000$, $\lambda = 0.010$, $d = 5$.
+
+Again, when I summarize the model, I see Saturated Fat, Salt, Sugars, and Fiber per 100g as the predictors with the highest relative importance, yet another result consistent with the other models.
+
+## Results
+
+Now that I have fit and tuned all of our models on the training/validation set, I calculate a Root Mean Squared Error and Mean Absolute Error for each one on the $\frac{1}{3}$ test set:
+
+
+|**Model**|**Root Mean Squared Error**|**Mean Absolute Error**|
+|-----------------|-----------------------|------------------|
+| Linear Regression | 4.92 |  3.78 | 
+| 5-NN Regression | 3.24 | 2.13 |
+| Generalized Additive Model | 1.76 | 1.05 |
+| Decision Tree | 3.63 | 2.76|
+| Random Forest | **0.69** | **0.35**|
+| Boosting | 0.71 | 0.41|
+
+Based on these test errors, the Random Forest is my model of choice, slightly beating out the boosting model. This is to be expected, as these are two of the highest-performing statistical learning methods. The GAM also performed very well, suggesting that it is a good compromise between predictive power and interpretability. As expected, the decision tree and linear regression models did not perform as well. Here, I really consider these only as baselines for their more advanced counterparts. Overall, it looks like this is a highly nonlinear regression problem, and the random forest provides the best way to predict nutrition score.
+
+The second part of the analysis was to better understand the drivers of nutrition score, and fortunately, the results were pretty similar among all the models. While nearly all of the numeric variables corresponding to nutrition information play at least some role in the score, Saturated Fat, Sugars, Energy, Salt, and Fiber per 100g are generally the most important predictors of nutrition score.
+
+## Limitations and Future Directions
+
+1. One of the major limitations of this analysis is computational power. At several points, I had to make concessions. Here are some examples:  
+    a. Cleaning the brands in the data to reduce the number of unique values. Maybe brands would have had more predictive power if I had not transformed it or dropped it altogether in many of the later model specifications.
+    b. While the GAM performed very well as is, I would have liked to improve upon the variable selection procedure by being able to experiment with different basis dimensions for the various smoothing terms to obtain stabler results.
+    c. In the boosting model, I was forced to use a training/validation structure instead of performing cross validation to select the optimal parameters. This means the obtained errors likely have higher variance as they are more dependent on the random split of data.  
+2. The data itself also forced some compromising:
+    a. I was left with just over 30% of the original data and roughly $\frac{1}{8}$ of the original predictors after running diagnostics to identify missing values.
+    b. There were other variables I would have liked to use that just required too much cleaning for the scope of this analysis. One example was Serving Size, which varied in units and format across foods without a clear way to standardize the measurement.  
+3. This is a dynamic dataset, and it would be interesting to return to the analysis when more missing values are filled in, especially for foods in countries besides the United States.  
+4. France also computes a nutrition score (A, B, C, D, or E) which is directly based on the nutrition grade. Future work could explore the predictive accuracy of multi-class classification models applied to this research question.
+
+
+
+
+# Appendix
+
+### Data Cleaning
+
+```{r warning = FALSE, message = FALSE}
+food_lim <- food %>%
+  filter(!is.na(`nutrition-score-fr_100g`)) %>%
+  rename(nutrition_score_fr = `nutrition-score-fr_100g`)
+
+
+missing_vals <- data.frame(missing = map_dbl(food_lim, function(x) sum(is.na(x))),
+                           nonmissing = map_dbl(food_lim, function(x) sum(!is.na(x)))) %>%
+  arrange(missing)
+
+plot(missing_vals$nonmissing, main = 'Non-Missing Values for Each Feature',
+     xlab = 'Variable Number', ylab = '# Non-Missing Values')
+abline(h = 100000, lty = 'dashed')
+
+rel_vars <- rownames(filter(missing_vals, nonmissing > 100000))
+
+
+food_lim <- food_lim %>%
+  select(nutrition_score_fr, country = countries_en, brands, energy_100g, 
+         sat_fat_100g = `saturated-fat_100g`, sugars_100g, proteins_100g, 
+         salt_100g, sodium_100g, fat_100g, carbs_100g = carbohydrates_100g,
+         additives_n, from_palm = ingredients_from_palm_oil_n, 
+         maybe_palm = ingredients_that_may_be_from_palm_oil_n,
+         fiber_100g, cholest_100g = cholesterol_100g, calcium_100g, 
+         trans_fat_100g = `trans-fat_100g`, iron_100g,
+         vit_a_100g = `vitamin-a_100g`, vit_c_100g = `vitamin-c_100g`) %>%
+  na.omit()
+```
+
+
+### Brands Lookup
+- Generate counts of brand names to facilitate data cleaning in Excel  
+- Notes on brand cleaning:  
+  1. If multiple brands listed, went with the first listed name for simplicity  
+2. Classified brands with $<150$ observations as 'Other" to avoid too many distinct values
+- Re-import the lookup 'brands_lookup.csv' after cleaning the brands
+- Merge the clean brand onto the rest of the food data
+```{r message = FALSE, warning = FALSE}
+food_lim <- left_join(food_lim, brands_lookup, by='brands') %>%
+  mutate(brands = as.factor(ifelse(is.na(clean_brand), 'Other', clean_brand))) %>%
+  select(-count,-clean_brand)
+```
+
+### EDA Plots
+
+```{r message = FALSE, warning = FALSE}
+
+attach(food_lim)
+hist(nutrition_score_fr,probability = T,main = 
+         'Histogram of Nutrition Score with Normal Density Overlaid')
+x <- seq(min(nutrition_score_fr),max(nutrition_score_fr),0.5)
+lines(x,dnorm(x,mean(nutrition_score_fr),sd(nutrition_score_fr))) 
+#Doesn't seem to match normal distribution
+qqnorm(nutrition_score_fr)
+
+unique_vars <- unique(select(food_lim, -country, -brands) %>% colnames())
+cor_matrix <- data.frame(cor(select(food_lim, -country, -brands))) %>%
+  gather() %>%
+  mutate(var2 = rep(unique_vars, length(unique_vars))) %>%
+  select(var1 = key, var2, corr = value)
+
+ggplot(cor_matrix, aes(var1,var2,fill=corr)) + geom_tile() + 
+    theme(axis.text.x = element_text(angle = 45, hjust=1,vjust=0.75)) + 
+    ggtitle('Correlation Heat Map \nOpen Food Facts Predictors') + 
+  scale_fill_gradient2(low = scales::muted('blue'), 
+                       mid = 'white', 
+                       high = scales::muted('red')) + 
+  xlab('Variable 1') + ylab('Variable 2')
+
+```
+
+
+### Variable Selection via LASSO
+
+```{r message = FALSE, warning = FALSE}
+food_lim <- dplyr::select(food_lim, -country) #Excluding country due to most being US
+set.seed(443)
+x <- model.matrix(nutrition_score_fr~., data=food_lim)[,-1]
+y <- food_lim$nutrition_score_fr
+train <- sample(1:nrow(x),2*nrow(x)/3)
+y_test <- y[-train]
+cv_feature <- cv.glmnet(x[train,], y[train], alpha = 1)
+plot(cv_feature)
+cat('Best Lambda =', cv_feature$lambda.min)
+cat('1 SE Lambda =', cv_feature$lambda.1se,'\n')
+coef(cv_feature)
+rm(x) #Memory reasons
+```
+### Linear Regression
+
+```{r message = FALSE, warning = FALSE}
+lm.fit <- lm(nutrition_score_fr ~ energy_100g + sat_fat_100g + sugars_100g + fiber_100g, 
+             data = food_lim, subset = train)
+summary(lm.fit)
+lm.preds <- predict(lm.fit, newdata = food_lim[-train,])
+```
+
+### KNN Regression
+
+```{r message = FALSE, warning = FALSE}
+X_train <- food_lim[train,] %>% select(energy_100g, sat_fat_100g, sugars_100g, fiber_100g)
+X_test <- food_lim[-train,] %>% select(energy_100g, sat_fat_100g, sugars_100g, fiber_100g)
+y_train <- y[train]
+#Derive own 10-fold CV to select optimal k
+set.seed(443)
+folds <- sample(rep(1:10, length=nrow(X_train))) #Check folds are of equal size
+table(folds)
+cv_errors <- matrix(0,10,10)
+for (i in 1:10){
+  for (j in seq(1,20,2)){
+    knn_pred <- knn.reg(X_train[folds!=i,], X_train[folds==i,], 
+                        y_train[folds!=i], k=j)$pred
+    cv_errors[i,j%/%2+1] <- mean((knn_pred-y_train[folds==i])^2,na.rm=T)
+  }
+}
+MSE <- colMeans(cv_errors)
+plot(seq(1,20,2), MSE,xlab = 'K',ylab='CV Error',type = 'both',
+     main = 'KNN CV Error for different K-values')
+points(5,min(MSE),col='red',pch=19)
+
+
+knn.preds <- knn.reg(X_train, X_test, y_train, k=5)$pred
+rm(X_train, X_test, y_train) #Memory reasons
+```
+
+
+### GAM
+```{r message=FALSE, warning = FALSE}
+#Individually smooth each numeric variable and use select = TRUE for group lasso
+set.seed(443)
+gam.fit <- bam(nutrition_score_fr ~ from_palm + maybe_palm + s(energy_100g) + 
+                   s(sat_fat_100g) + s(sugars_100g) + s(proteins_100g) + 
+                   s(salt_100g) + s(sodium_100g) + s(fat_100g) + s(carbs_100g) + 
+                   s(additives_n) + s(fiber_100g) + s(cholest_100g) + 
+                   s(calcium_100g) + s(trans_fat_100g) + s(iron_100g) + 
+                   s(vit_a_100g) + s(vit_c_100g), select = TRUE, 
+               method = 'REML', data = food_lim[train,])
+summary(gam.fit)
+gam.preds <- predict(gam.fit, newdata = food_lim[-train,])
+plot.gam(gam.fit, scale = 0, pages = 2, all.terms = TRUE)
+gam.check(gam.fit)
+```
+
+### Regression Tree
+
+```{r message = FALSE, warning = FALSE}
+set.seed(443)
+tree.fit <- tree(nutrition_score_fr~.-brands, data=food_lim, subset=train)
+cv.tree.fit <- cv.tree(tree.fit)
+cv.tree.fit
+plot(cv.tree.fit$size, cv.tree.fit$dev, type="b",xlab = '# Terminal Nodes',
+     ylab = 'CV Error', main = 'Choosing Optimal Tree Size via CV')
+points(9,min(cv.tree.fit$dev),col='red',pch=19)
+prune.fit <- prune.tree(tree.fit, best=9)
+plot(prune.fit)
+text(prune.fit, pretty=0, cex=0.5)
+tree.preds <- predict(prune.fit, newdata = food_lim[-train,])
+```
+
+```{r message = FALSE, warning = FALSE}
+set.seed(443)
+rf.tune <- randomForest(nutrition_score_fr~.-brands, data=food_lim,
+                        subset=train, mtry=6,
+                        importance=TRUE, ntree = 250)
+rf.tune
+plot(rf.tune$mse, xlab = 'Number of Trees', ylab = 'OOB Error', 
+     main = 'Out-Of-Bag Error by # of Trees in Random Forest')
+abline(v=150, lty='dashed')
+
+#Refit tree with B = 150
+rm(rf.tune) #Memory reasons
+rf.fit <- randomForest(nutrition_score_fr~.-brands, data=food_lim, subset=train, mtry=6,
+                       importance=TRUE, ntree = 150)
+importance(rf.fit)
+varImpPlot(rf.fit)
+rf.preds <- predict(rf.fit, newdata = food_lim[-train,])
+```
+
+``` {r message = FALSE, warning = FALSE}
+#Grid of values for d and lambda
+param_grid <- expand.grid(shrinkage = c(.001, 0.005, 0.01),
+                          interaction.depth = 1:5)
+
+set.seed(443)  
+for(i in 1:nrow(param_grid)){
+  boost.tune <- gbm(nutrition_score_fr~.-brands, data = food_lim[train,],
+                    distribution = 'gaussian', n.trees = 5000,
+                    interaction.depth = param_grid$interaction.depth[i],
+                    shrinkage = param_grid$shrinkage[i],
+                    n.cores = 4,
+                    train.fraction = 0.7)
+  
+  param_grid$opt_trees[i] <- which.min(boost.tune$valid.error)
+  param_grid$opt_MSE[i] <- sqrt(min(boost.tune$valid.error))
+}
+param_grid
+
+#Refit tuned model to entire training data
+boost.fit <- gbm(nutrition_score_fr~.-brands, data = food_lim[train,],
+                 distribution = 'gaussian', n.trees = 5000, interaction.depth = 5,
+                 shrinkage = 0.01, n.cores = 4)
+summary(boost.fit)
+boost.preds <- predict(boost.fit, newdata = food_lim[-train,])
+
+```
+
+```{r message = FALSE, warning = FALSE}
+models <- c('Linear Regression', 'KNN Regression', 'GAM', 
+            'Decision Tree', 'Random Forest', 'Boosting')
+preds <- list(lm.preds, knn.preds, gam.preds, tree.preds, rf.preds, boost.preds)
+names(preds) <- models
+(RMSEs <- lapply(preds, function(x) sqrt(mean((x - y_test)^2))))
+(MAEs <- lapply(preds, function(x) mean(abs(x - y_test))))
+```
+
+
