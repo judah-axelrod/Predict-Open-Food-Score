@@ -17,5 +17,5 @@ Here is a quick overview of the files in this repository:
 - **brands_lookup.csv** is a lookup file I made to consolidate and clean many of the brand names associated with foods in the database
 - The raw data is not included here, but it can be downloaded from Kaggle at the link up top
 
-Thanks to Professor Xinghao Qiao and my peers in LSE's ST443 course for their teaching and collaboration.
+Thanks to Professor Xinghao Qiao and my peers in LSE's ST443 Machine Learning and Data Mining course for their teaching and collaboration.
 
